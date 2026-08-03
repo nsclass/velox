@@ -1045,33 +1045,77 @@ std::vector<TypePtr> IcebergSplitReader::adaptColumns(
                    partitionIt != fileSplit_->partitionKeys.end()) {
           setPartitionValue(childSpec.get(), fieldName, partitionIt->second);
         } else {
-          // Check if column has an initial-default value (Iceberg V3)
+          // Check if column has an initial-default value (Iceberg V3).
+          // Search both the output assignments (columnHandles_) and the
+          // predicate-only column handles on the table handle. When
+          // pushdown_filter_enabled=true a column can appear in the WHERE
+          // clause without being projected in the SELECT output: in that case
+          // the Java coordinator places it in predicateColumns on the layout
+          // handle, which the connector converter stores in
+          // HiveTableHandle::filterColumnHandles_ — but it is NOT in the
+          // TableScanNode::assignments that feed columnHandles_.
           bool hasDefaultValue = false;
-          // The columnHandles_ map is keyed by output name (which may be an
-          // alias). We need to find the column handle where the handle's name()
-          // matches fieldName. fieldName is the table column name from
-          // readerOutputType_.
-          for (const auto& [outputName, handle] : *columnHandles_) {
-            if (handle->name() == fieldName) {
-              auto icebergColumnHandle =
-                  std::dynamic_pointer_cast<const IcebergColumnHandle>(handle);
-              if (icebergColumnHandle &&
-                  icebergColumnHandle->initialDefaultValue().has_value()) {
-                // Use initial-default value for schema evolution.
-                auto columnType = tableSchema->findChild(fieldName);
-                VELOX_CHECK_NOT_NULL(
-                    columnType,
-                    "Column '{}' not found in table schema",
-                    fieldName);
-                auto constant = newConstantFromString(
-                    columnType,
-                    icebergColumnHandle->initialDefaultValue().value(),
-                    connectorQueryCtx_->memoryPool(),
-                    readTimestampAsLocalTime,
-                    false);
-                childSpec->setConstantValue(constant);
+
+          // Helper: try one handle. If it is an IcebergColumnHandle for
+          // fieldName and carries an initial-default value, install the
+          // constant on childSpec and return true.
+          auto tryHandle =
+              [&](const IcebergColumnHandle* icebergHandle) -> bool {
+            if (!icebergHandle || icebergHandle->name() != fieldName ||
+                !icebergHandle->initialDefaultValue().has_value()) {
+              return false;
+            }
+            auto columnType = tableSchema->findChild(fieldName);
+            VELOX_CHECK_NOT_NULL(
+                columnType, "Column '{}' not found in table schema", fieldName);
+            childSpec->setConstantValue(newConstantFromString(
+                columnType,
+                icebergHandle->initialDefaultValue().value(),
+                connectorQueryCtx_->memoryPool(),
+                readTimestampAsLocalTime,
+                false));
+            return true;
+          };
+
+          // 1. Search output-projected handles (columnHandles_ keyed by alias).
+          //    columnHandles_ is built from TableScanNode::assignments, which
+          //    only contains columns projected in the SELECT output.
+          if (columnHandles_) {
+            for (const auto& [outputName, handle] : *columnHandles_) {
+              if (tryHandle(
+                      dynamic_cast<const IcebergColumnHandle*>(handle.get()))) {
                 hasDefaultValue = true;
                 break;
+              }
+            }
+          }
+
+          // 2. If not found, search predicate-only handles stored on the table
+          //    handle. When pushdown_filter_enabled=true a column may appear
+          //    only in the WHERE clause (not in SELECT), so the Java
+          //    coordinator puts it in predicateColumns on the layout handle,
+          //    which the Presto-to-Velox converter stores in
+          //    HiveTableHandle::filterColumnHandles_. Those handles are NOT
+          //    in TableScanNode::assignments and thus not in columnHandles_.
+          // 2. If not found, search predicate-only handles stored on the table
+          //    handle. When pushdown_filter_enabled=true a column may appear
+          //    only in the WHERE clause (not in SELECT), so the Java
+          //    coordinator puts it in predicateColumns on the layout handle,
+          //    which the Presto-to-Velox converter stores in
+          //    HiveTableHandle::filterColumnHandles_. Those handles are NOT
+          //    in TableScanNode::assignments and thus not in columnHandles_.
+          if (!hasDefaultValue) {
+            auto* hiveTableHandle =
+                dynamic_cast<const HiveTableHandle*>(tableHandle_.get());
+            if (hiveTableHandle) {
+              for (const auto& handle :
+                   hiveTableHandle->hiveFilterColumnHandles()) {
+                if (tryHandle(
+                        dynamic_cast<const IcebergColumnHandle*>(
+                            handle.get()))) {
+                  hasDefaultValue = true;
+                  break;
+                }
               }
             }
           }
